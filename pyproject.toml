@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codebase2nlm"
+version = "0.1.0"
+description = "Convert a codebase into NotebookLM-ready markdown document(s)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "You" }]
+keywords = ["notebooklm", "codebase", "llm", "documentation"]
+dependencies = [
+    "pathspec>=0.12",
+]
+
+[project.scripts]
+codebase2nlm = "codebase2nlm:main"
+
+[tool.setuptools]
+py-modules = ["codebase2nlm"]

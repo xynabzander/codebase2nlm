@@ -1,0 +1,19 @@
+# Python build / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# The tool's own output, in case you test it inside the repo
+notebooklm_output/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
