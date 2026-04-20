@@ -383,7 +383,7 @@ def write_output(root: Path,
         )
 
     if within_limits(single_text) or not sections:
-        out = output_dir / "codebase.md"
+        out = output_dir / f"{root.name}.md"
         out.write_text(single_text, encoding="utf-8")
         print(f"  wrote {out}  ({total_words:,} words, {total_lines:,} lines, "
               f"{total_bytes:,} bytes, "
@@ -412,7 +412,7 @@ def write_output(root: Path,
         files_in_part = [rel for rel, _, _, _, _ in part_sections]
         header = make_header(part=(i, n), files_in_part=files_in_part)
         body = "".join(b for _, b, _, _, _ in part_sections)
-        out = output_dir / f"codebase_part{i:0{pad}d}.md"
+        out = output_dir / f"{root.name}_part{i:0{pad}d}.md"
         text = header + body
         out.write_text(text, encoding="utf-8")
         print(f"  wrote {out}  ({len(text.split()):,} words, {line_count(text):,} lines, "
