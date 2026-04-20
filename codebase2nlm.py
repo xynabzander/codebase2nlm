@@ -6,7 +6,7 @@ Crawl a codebase, respecting .gitignore and .crawlignore, and emit markdown
 document(s) suitable for uploading to NotebookLM as sources.
 
 Usage:
-    codebase2nlm [PATH] [-o OUTPUT_DIR] [--max-words N]
+    codebase2nlm [PATH] [-o OUTPUT_DIR] [--max-words N] [--max-lines N] [--max-mb N]
 
 If PATH is omitted, the current directory is used.
 """
@@ -29,6 +29,9 @@ except ImportError:  # pragma: no cover
 # ----------------------------- configuration --------------------------------
 
 DEFAULT_MAX_WORDS = 450_000          # safely below NotebookLM's ~500k limit
+DEFAULT_MAX_LINES = 95_000           # safety target below observed ~100k NotebookLM line cap
+DEFAULT_MAX_BYTES = 190 * 1024 * 1024  # safely below NotebookLM's 200MB upload limit
+NOTEBOOK_SOURCE_LIMIT = 50
 DEFAULT_OUTPUT_NAME = "notebooklm_output"
 
 ALWAYS_IGNORE_DIRS = {
@@ -221,19 +224,95 @@ def read_text(path: Path) -> Optional[str]:
         return None
 
 
+# ------------------------------- budgeting ----------------------------------
+
+def line_count(text: str) -> int:
+    if not text:
+        return 0
+    return text.count("\n") + 1
+
+
+def byte_count(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def build_section(rel: str,
+                  content: str,
+                  lang: str,
+                  chunk_index: Optional[int] = None,
+                  chunk_total: Optional[int] = None) -> str:
+    chunk_label = ""
+    if chunk_index is not None and chunk_total is not None:
+        chunk_label = f" (chunk {chunk_index} of {chunk_total})"
+    fence = code_fence_for(content)
+    return f"\n### `{rel}`{chunk_label}\n\n{fence}{lang}\n{content}\n{fence}\n"
+
+
+def split_oversized_content(rel: str,
+                            content: str,
+                            lang: str,
+                            base_header: str,
+                            max_words: int,
+                            max_lines: int,
+                            max_bytes: int) -> List[str]:
+    """Split an oversized file content into chunked sections that fit limits."""
+    whole = build_section(rel, content, lang)
+    if (
+        len((base_header + whole).split()) <= max_words
+        and line_count(base_header + whole) <= max_lines
+        and byte_count(base_header + whole) <= max_bytes
+    ):
+        return [whole]
+
+    lines = content.splitlines(keepends=True)
+    if not lines:
+        return [whole]
+
+    chunks_raw: List[str] = []
+    i = 0
+    while i < len(lines):
+        lo, hi = i + 1, len(lines)
+        best = i
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = "".join(lines[i:mid])
+            probe = build_section(rel, candidate, lang, chunk_index=1, chunk_total=9999)
+            text = base_header + probe
+            fits = (
+                len(text.split()) <= max_words
+                and line_count(text) <= max_lines
+                and byte_count(text) <= max_bytes
+            )
+            if fits:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        if best == i:
+            # Last-resort fallback: force progress even if one very long line breaches budget.
+            best = i + 1
+        chunks_raw.append("".join(lines[i:best]))
+        i = best
+
+    total = len(chunks_raw)
+    return [build_section(rel, c, lang, idx, total) for idx, c in enumerate(chunks_raw, 1)]
+
+
 # ------------------------------ main driver ---------------------------------
 
 def write_output(root: Path,
                  output_dir: Path,
                  files: List[Path],
-                 max_words: int) -> None:
+                 max_words: int,
+                 max_lines: int,
+                 max_bytes: int) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     project = root.name or "codebase"
 
     rel_paths = [f.relative_to(root).as_posix() for f in files]
     binary_set = set()
-    sections: List[Tuple[str, str, int]] = []  # (rel, block, word_count)
-
+    text_files: List[Tuple[Path, str, str]] = []  # (path, rel, content)
     for f, rel in zip(files, rel_paths):
         if is_binary_file(f):
             binary_set.add(rel)
@@ -242,12 +321,10 @@ def write_output(root: Path,
         if content is None:
             binary_set.add(rel)
             continue
-        fence = code_fence_for(content)
-        lang = lang_for(f)
-        block = f"\n### `{rel}`\n\n{fence}{lang}\n{content}\n{fence}\n"
-        sections.append((rel, block, len(block.split())))
+        text_files.append((f, rel, content))
 
     tree_str = build_tree(root, files, binary_set)
+    chunked_files: set[str] = set()
 
     def make_header(part: Optional[Tuple[int, int]] = None,
                     files_in_part: Optional[List[str]] = None) -> str:
@@ -264,52 +341,83 @@ def write_output(root: Path,
         if binary_set:
             h.append("\n## Binary / skipped files (listed in tree, contents omitted)\n\n")
             h.append("\n".join(f"- `{p}`" for p in sorted(binary_set)) + "\n")
+        if chunked_files:
+            h.append("\n## Chunked files (split across multiple sections)\n\n")
+            h.append("\n".join(f"- `{p}`" for p in sorted(chunked_files)) + "\n")
         if files_in_part is not None:
             h.append("\n## Files included in this part\n\n")
             h.append("\n".join(f"- `{p}`" for p in files_in_part) + "\n")
         h.append("\n## Contents\n")
         return "".join(h)
 
-    single_header = make_header()
-    single_body = "".join(b for _, b, _ in sections)
-    total_words = len((single_header + single_body).split())
+    base_header = make_header(part=(1, 1), files_in_part=[])
 
-    if total_words <= max_words or not sections:
+    sections: List[Tuple[str, str, int, int, int]] = []  # (rel, block, words, lines, bytes)
+    for f, rel, content in text_files:
+        lang = lang_for(f)
+        file_sections = split_oversized_content(rel, content, lang, base_header,
+                                                max_words, max_lines, max_bytes)
+        if len(file_sections) > 1:
+            chunked_files.add(rel)
+        for block in file_sections:
+            sections.append((rel, block, len(block.split()), line_count(block), byte_count(block)))
+
+    single_header = make_header()
+    single_body = "".join(b for _, b, _, _, _ in sections)
+    single_text = single_header + single_body
+    total_words = len(single_text.split())
+    total_lines = line_count(single_text)
+    total_bytes = byte_count(single_text)
+
+    def within_limits(text: str) -> bool:
+        return (
+            len(text.split()) <= max_words
+            and line_count(text) <= max_lines
+            and byte_count(text) <= max_bytes
+        )
+
+    if within_limits(single_text) or not sections:
         out = output_dir / "codebase.md"
-        out.write_text(single_header + single_body, encoding="utf-8")
-        print(f"  wrote {out}  ({total_words:,} words, "
+        out.write_text(single_text, encoding="utf-8")
+        print(f"  wrote {out}  ({total_words:,} words, {total_lines:,} lines, "
+              f"{total_bytes:,} bytes, "
               f"{len(sections)} text files, {len(binary_set)} binary skipped)")
         return
 
-    # Split
-    parts: List[List[Tuple[str, str, int]]] = [[]]
-    approx_header_wc = len(single_header.split())
-    running = approx_header_wc
+    # Split by all per-source limits (words, lines, and bytes).
+    parts: List[List[Tuple[str, str, int, int, int]]] = []
+    current: List[Tuple[str, str, int, int, int]] = []
     for sec in sections:
-        _, _, wc = sec
-        if wc > max_words - approx_header_wc and parts[-1]:
-            parts.append([sec])
-            parts.append([])
-            running = approx_header_wc
-            continue
-        if running + wc > max_words and parts[-1]:
-            parts.append([])
-            running = approx_header_wc
-        parts[-1].append(sec)
-        running += wc
+        candidate = current + [sec]
+        probe_header = make_header(part=(1, 1),
+                                   files_in_part=[rel for rel, _, _, _, _ in candidate])
+        probe_text = probe_header + "".join(b for _, b, _, _, _ in candidate)
+        if current and not within_limits(probe_text):
+            parts.append(current)
+            current = [sec]
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
 
-    parts = [p for p in parts if p]
     n = len(parts)
+    pad = max(2, len(str(n)))
     for i, part_sections in enumerate(parts, 1):
-        files_in_part = [rel for rel, _, _ in part_sections]
+        files_in_part = [rel for rel, _, _, _, _ in part_sections]
         header = make_header(part=(i, n), files_in_part=files_in_part)
-        body = "".join(b for _, b, _ in part_sections)
-        out = output_dir / f"codebase_part{i}.md"
+        body = "".join(b for _, b, _, _, _ in part_sections)
+        out = output_dir / f"codebase_part{i:0{pad}d}.md"
         text = header + body
         out.write_text(text, encoding="utf-8")
-        print(f"  wrote {out}  ({len(text.split()):,} words, "
+        print(f"  wrote {out}  ({len(text.split()):,} words, {line_count(text):,} lines, "
+              f"{byte_count(text):,} bytes, "
               f"{len(part_sections)} files)")
+        if not within_limits(text):
+            print(f"  warning: {out.name} still exceeds configured limits (likely due to header overhead)")
     print(f"\nSplit into {n} parts. Upload each .md as a separate NotebookLM source.")
+    if n > NOTEBOOK_SOURCE_LIMIT:
+        print(f"warning: produced {n} parts; NotebookLM notebooks accept up to "
+              f"{NOTEBOOK_SOURCE_LIMIT} sources per notebook")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -329,6 +437,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-words", type=int, default=DEFAULT_MAX_WORDS,
         help=f"Max words per output file before splitting "
              f"(default: {DEFAULT_MAX_WORDS:,}).",
+    )
+    p.add_argument(
+        "--max-lines", type=int, default=DEFAULT_MAX_LINES,
+        help=f"Max lines per output file before splitting "
+             f"(default: {DEFAULT_MAX_LINES:,}).",
+    )
+    p.add_argument(
+        "--max-mb", type=float, default=DEFAULT_MAX_BYTES / (1024 * 1024),
+        help="Max MB per output file before splitting (default: 190).",
     )
     p.add_argument(
         "--no-gitignore", action="store_true",
@@ -372,7 +489,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         print("Nothing to write.")
         return
 
-    write_output(root, output_dir, files, args.max_words)
+    max_bytes = int(args.max_mb * 1024 * 1024)
+    write_output(root, output_dir, files, args.max_words, args.max_lines, max_bytes)
     print("\nDone. Upload the .md file(s) as sources in NotebookLM.")
 
 
