@@ -71,6 +71,9 @@ codebase2nlm ~/projects/myapp -o ~/Desktop/myapp-notebooklm
 # tweak the per-file word limit
 codebase2nlm ~/projects/myapp --max-words 400000
 
+# tweak line and byte limits too (NotebookLM-friendly defaults are used automatically)
+codebase2nlm ~/projects/myapp --max-lines 100000 --max-bytes 199000000
+
 # ignore .gitignore (still respects .crawlignore and built-in skips)
 codebase2nlm ~/projects/myapp --no-gitignore
 ```
@@ -85,4 +88,8 @@ single source) to NotebookLM.
 - Skips common noise: `.git`, `node_modules`, `__pycache__`, `.venv`, lockfiles, etc.
 - Lists binary files in the tree tagged `(binary — contents omitted)`, skips their contents.
 - Produces a full ASCII file tree at the top, followed by every text file's contents in labeled code fences.
-- Auto-splits into `codebase_part1.md`, `codebase_part2.md`, ... only when the total would exceed NotebookLM's per-source word limit.
+- Auto-splits into `codebase_part1.md`, `codebase_part2.md`, ... when any NotebookLM per-source limit would be exceeded:
+  - word count (default target: 450k to stay below 500k),
+  - line count (default: 100k lines),
+  - upload size (default target: 190MB to stay below 200MB).
+- Warns when output creates more than 50 parts (NotebookLM notebook source count limit).

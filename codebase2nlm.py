@@ -29,6 +29,9 @@ except ImportError:  # pragma: no cover
 # ----------------------------- configuration --------------------------------
 
 DEFAULT_MAX_WORDS = 450_000          # safely below NotebookLM's ~500k limit
+DEFAULT_MAX_LINES = 100_000          # NotebookLM line limit per text/markdown source
+DEFAULT_MAX_BYTES = 190 * 1024 * 1024  # safely below NotebookLM's 200MB upload limit
+NOTEBOOK_SOURCE_LIMIT = 50
 DEFAULT_OUTPUT_NAME = "notebooklm_output"
 
 ALWAYS_IGNORE_DIRS = {
@@ -221,18 +224,32 @@ def read_text(path: Path) -> Optional[str]:
         return None
 
 
+# ------------------------------- budgeting ----------------------------------
+
+def line_count(text: str) -> int:
+    if not text:
+        return 0
+    return text.count("\n") + 1
+
+
+def byte_count(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
 # ------------------------------ main driver ---------------------------------
 
 def write_output(root: Path,
                  output_dir: Path,
                  files: List[Path],
-                 max_words: int) -> None:
+                 max_words: int,
+                 max_lines: int,
+                 max_bytes: int) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     project = root.name or "codebase"
 
     rel_paths = [f.relative_to(root).as_posix() for f in files]
     binary_set = set()
-    sections: List[Tuple[str, str, int]] = []  # (rel, block, word_count)
+    sections: List[Tuple[str, str, int, int, int]] = []  # (rel, block, words, lines, bytes)
 
     for f, rel in zip(files, rel_paths):
         if is_binary_file(f):
@@ -245,7 +262,7 @@ def write_output(root: Path,
         fence = code_fence_for(content)
         lang = lang_for(f)
         block = f"\n### `{rel}`\n\n{fence}{lang}\n{content}\n{fence}\n"
-        sections.append((rel, block, len(block.split())))
+        sections.append((rel, block, len(block.split()), line_count(block), byte_count(block)))
 
     tree_str = build_tree(root, files, binary_set)
 
@@ -271,45 +288,60 @@ def write_output(root: Path,
         return "".join(h)
 
     single_header = make_header()
-    single_body = "".join(b for _, b, _ in sections)
-    total_words = len((single_header + single_body).split())
+    single_body = "".join(b for _, b, _, _, _ in sections)
+    single_text = single_header + single_body
+    total_words = len(single_text.split())
+    total_lines = line_count(single_text)
+    total_bytes = byte_count(single_text)
 
-    if total_words <= max_words or not sections:
+    def within_limits(text: str) -> bool:
+        return (
+            len(text.split()) <= max_words
+            and line_count(text) <= max_lines
+            and byte_count(text) <= max_bytes
+        )
+
+    if within_limits(single_text) or not sections:
         out = output_dir / "codebase.md"
-        out.write_text(single_header + single_body, encoding="utf-8")
-        print(f"  wrote {out}  ({total_words:,} words, "
+        out.write_text(single_text, encoding="utf-8")
+        print(f"  wrote {out}  ({total_words:,} words, {total_lines:,} lines, "
+              f"{total_bytes:,} bytes, "
               f"{len(sections)} text files, {len(binary_set)} binary skipped)")
         return
 
-    # Split
-    parts: List[List[Tuple[str, str, int]]] = [[]]
-    approx_header_wc = len(single_header.split())
-    running = approx_header_wc
+    # Split by all per-source limits (words, lines, and bytes).
+    parts: List[List[Tuple[str, str, int, int, int]]] = []
+    current: List[Tuple[str, str, int, int, int]] = []
     for sec in sections:
-        _, _, wc = sec
-        if wc > max_words - approx_header_wc and parts[-1]:
-            parts.append([sec])
-            parts.append([])
-            running = approx_header_wc
-            continue
-        if running + wc > max_words and parts[-1]:
-            parts.append([])
-            running = approx_header_wc
-        parts[-1].append(sec)
-        running += wc
+        candidate = current + [sec]
+        probe_header = make_header(part=(1, 1),
+                                   files_in_part=[rel for rel, _, _, _, _ in candidate])
+        probe_text = probe_header + "".join(b for _, b, _, _, _ in candidate)
+        if current and not within_limits(probe_text):
+            parts.append(current)
+            current = [sec]
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
 
-    parts = [p for p in parts if p]
     n = len(parts)
     for i, part_sections in enumerate(parts, 1):
-        files_in_part = [rel for rel, _, _ in part_sections]
+        files_in_part = [rel for rel, _, _, _, _ in part_sections]
         header = make_header(part=(i, n), files_in_part=files_in_part)
-        body = "".join(b for _, b, _ in part_sections)
+        body = "".join(b for _, b, _, _, _ in part_sections)
         out = output_dir / f"codebase_part{i}.md"
         text = header + body
         out.write_text(text, encoding="utf-8")
-        print(f"  wrote {out}  ({len(text.split()):,} words, "
+        print(f"  wrote {out}  ({len(text.split()):,} words, {line_count(text):,} lines, "
+              f"{byte_count(text):,} bytes, "
               f"{len(part_sections)} files)")
+        if not within_limits(text):
+            print(f"  warning: {out.name} exceeds configured limits due to a single oversized file section")
     print(f"\nSplit into {n} parts. Upload each .md as a separate NotebookLM source.")
+    if n > NOTEBOOK_SOURCE_LIMIT:
+        print(f"warning: produced {n} parts; NotebookLM notebooks accept up to "
+              f"{NOTEBOOK_SOURCE_LIMIT} sources per notebook")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -329,6 +361,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-words", type=int, default=DEFAULT_MAX_WORDS,
         help=f"Max words per output file before splitting "
              f"(default: {DEFAULT_MAX_WORDS:,}).",
+    )
+    p.add_argument(
+        "--max-lines", type=int, default=DEFAULT_MAX_LINES,
+        help=f"Max lines per output file before splitting "
+             f"(default: {DEFAULT_MAX_LINES:,}).",
+    )
+    p.add_argument(
+        "--max-bytes", type=int, default=DEFAULT_MAX_BYTES,
+        help=f"Max bytes per output file before splitting "
+             f"(default: {DEFAULT_MAX_BYTES:,}).",
     )
     p.add_argument(
         "--no-gitignore", action="store_true",
@@ -372,7 +414,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         print("Nothing to write.")
         return
 
-    write_output(root, output_dir, files, args.max_words)
+    write_output(root, output_dir, files, args.max_words, args.max_lines, args.max_bytes)
     print("\nDone. Upload the .md file(s) as sources in NotebookLM.")
 
 
